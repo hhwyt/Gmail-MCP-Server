@@ -1,7 +1,50 @@
 import fs from 'fs';
+import os from 'os';
 import path from 'path';
 import { lookup as mimeLookup } from 'mime-types';
 import nodemailer from 'nodemailer';
+
+/**
+ * The only directory this server reads attachments from (send/draft) and writes
+ * downloads to. Anything outside it is refused, so a prompt-injected request cannot
+ * mail out ~/.ssh or overwrite ~/.zshrc.
+ */
+export const FILES_DIR = process.env.GMAIL_MCP_FILES_DIR || path.join(os.homedir(), 'Downloads', 'gmail-mcp');
+
+function isInsideDirectory(directory: string, candidate: string): boolean {
+    const relative = path.relative(directory, candidate);
+    return relative === '' || (!relative.startsWith('..') && !path.isAbsolute(relative));
+}
+
+/**
+ * Resolves a path (absolute, or relative to FILES_DIR) and returns its real path,
+ * throwing unless it is inside FILES_DIR after symlinks are followed.
+ * mode 'existing-file' is for attachments to send; 'directory' creates the folder for downloads.
+ */
+export function resolveInsideFilesDir(requestedPath: string, mode: 'existing-file' | 'directory'): string {
+    fs.mkdirSync(FILES_DIR, { recursive: true });
+    const filesDirRealPath = fs.realpathSync(FILES_DIR);
+    const absolutePath = path.resolve(filesDirRealPath, requestedPath);
+    const refusal = new Error(`Refused: ${requestedPath} is outside ${FILES_DIR}. Copy the file there first.`);
+
+    if (!isInsideDirectory(filesDirRealPath, absolutePath)) throw refusal;
+    if (mode === 'directory') {
+        fs.mkdirSync(absolutePath, { recursive: true });
+    } else if (!fs.existsSync(absolutePath) || !fs.statSync(absolutePath).isFile()) {
+        throw new Error(`File does not exist: ${requestedPath}`);
+    }
+    const realPath = fs.realpathSync(absolutePath);
+    if (!isInsideDirectory(filesDirRealPath, realPath)) throw refusal;
+    return realPath;
+}
+
+/** Reduces a sender-controlled attachment name to a plain file name with no path parts. */
+export function sanitizeAttachmentFilename(filename: string, fallback: string): string {
+    const baseName = path.basename(filename.replace(/\\/g, '/')).replace(/[\x00-\x1f]/g, '').trim();
+    if (!baseName || baseName === '.' || baseName === '..') return fallback;
+    // A leading dot would create a hidden (and possibly shell-sourced) file
+    return baseName.replace(/^\.+/, '_');
+}
 
 /**
  * Helper function to encode email headers containing non-ASCII characters
@@ -114,11 +157,8 @@ export async function createEmailWithNodemailer(validatedArgs: any): Promise<str
 
     // Prepare attachments for nodemailer
     const attachments = [];
-    for (const filePath of validatedArgs.attachments) {
-        if (!fs.existsSync(filePath)) {
-            throw new Error(`File does not exist: ${filePath}`);
-        }
-        
+    for (const requestedPath of validatedArgs.attachments) {
+        const filePath = resolveInsideFilesDir(requestedPath, 'existing-file');
         const fileName = path.basename(filePath);
         
         attachments.push({

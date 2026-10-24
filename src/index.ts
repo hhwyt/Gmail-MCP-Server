@@ -16,7 +16,8 @@ import { fileURLToPath } from 'url';
 import http from 'http';
 import open from 'open';
 import os from 'os';
-import {createEmailMessage, createEmailWithNodemailer} from "./utl.js";
+import {createEmailMessage, createEmailWithNodemailer, resolveInsideFilesDir, sanitizeAttachmentFilename, FILES_DIR} from "./utl.js";
+import { keychainRead, keychainWrite } from "./keychain.js";
 import { createLabel, updateLabel, deleteLabel, listLabels, findLabelByName, getOrCreateLabel, GmailLabel } from "./label-manager.js";
 import { createFilter, listFilters, getFilter, deleteFilter, filterTemplates, GmailFilterCriteria, GmailFilterAction } from "./filter-manager.js";
 
@@ -25,7 +26,11 @@ const __dirname = path.dirname(fileURLToPath(import.meta.url));
 // Configuration paths
 const CONFIG_DIR = path.join(os.homedir(), '.gmail-mcp');
 const OAUTH_PATH = process.env.GMAIL_OAUTH_PATH || path.join(CONFIG_DIR, 'gcp-oauth.keys.json');
-const CREDENTIALS_PATH = process.env.GMAIL_CREDENTIALS_PATH || path.join(CONFIG_DIR, 'credentials.json');
+
+// Keychain item names. GMAIL_ACCOUNT lets several instances (one per mailbox) share
+// the same OAuth client while keeping separate tokens, e.g. GMAIL_ACCOUNT=hhwyt1.
+const OAUTH_CLIENT_KEYCHAIN_ACCOUNT = 'oauth-client';
+const TOKEN_KEYCHAIN_ACCOUNT = `token:${process.env.GMAIL_ACCOUNT || 'default'}`;
 
 // Type definitions for Gmail API responses
 interface GmailMessagePart {
@@ -95,27 +100,20 @@ function extractEmailContent(messagePart: GmailMessagePart): EmailContent {
 
 async function loadCredentials() {
     try {
-        // Create config directory if it doesn't exist
-        if (!process.env.GMAIL_OAUTH_PATH && !CREDENTIALS_PATH &&!fs.existsSync(CONFIG_DIR)) {
-            fs.mkdirSync(CONFIG_DIR, { recursive: true });
+        // OAuth client keys live in the keychain. On first run they are imported once from
+        // gcp-oauth.keys.json; after that the file can be deleted.
+        let keysJson = await keychainRead(OAUTH_CLIENT_KEYCHAIN_ACCOUNT);
+        if (!keysJson) {
+            if (!fs.existsSync(OAUTH_PATH)) {
+                console.error('Error: OAuth keys not found in keychain and no file at', OAUTH_PATH);
+                process.exit(1);
+            }
+            keysJson = fs.readFileSync(OAUTH_PATH, 'utf8');
+            await keychainWrite(OAUTH_CLIENT_KEYCHAIN_ACCOUNT, keysJson);
+            console.error(`OAuth keys imported into keychain. You can now delete ${OAUTH_PATH}.`);
         }
 
-        // Check for OAuth keys in current directory first, then in config directory
-        const localOAuthPath = path.join(process.cwd(), 'gcp-oauth.keys.json');
-        let oauthPath = OAUTH_PATH;
-
-        if (fs.existsSync(localOAuthPath)) {
-            // If found in current directory, copy to config directory
-            fs.copyFileSync(localOAuthPath, OAUTH_PATH);
-            console.log('OAuth keys found in current directory, copied to global config.');
-        }
-
-        if (!fs.existsSync(OAUTH_PATH)) {
-            console.error('Error: OAuth keys file not found. Please place gcp-oauth.keys.json in current directory or', CONFIG_DIR);
-            process.exit(1);
-        }
-
-        const keysContent = JSON.parse(fs.readFileSync(OAUTH_PATH, 'utf8'));
+        const keysContent = JSON.parse(keysJson);
         const keys = keysContent.installed || keysContent.web;
 
         if (!keys) {
@@ -133,9 +131,9 @@ async function loadCredentials() {
             callback
         );
 
-        if (fs.existsSync(CREDENTIALS_PATH)) {
-            const credentials = JSON.parse(fs.readFileSync(CREDENTIALS_PATH, 'utf8'));
-            oauth2Client.setCredentials(credentials);
+        const credentialsJson = await keychainRead(TOKEN_KEYCHAIN_ACCOUNT);
+        if (credentialsJson) {
+            oauth2Client.setCredentials(JSON.parse(credentialsJson));
         }
     } catch (error) {
         console.error('Error loading credentials:', error);
@@ -175,7 +173,7 @@ async function authenticate() {
             try {
                 const { tokens } = await oauth2Client.getToken(code);
                 oauth2Client.setCredentials(tokens);
-                fs.writeFileSync(CREDENTIALS_PATH, JSON.stringify(tokens));
+                await keychainWrite(TOKEN_KEYCHAIN_ACCOUNT, JSON.stringify(tokens));
 
                 res.writeHead(200);
                 res.end('Authentication successful! You can close this window.');
@@ -201,7 +199,7 @@ const SendEmailSchema = z.object({
     bcc: z.array(z.string()).optional().describe("List of BCC recipients"),
     threadId: z.string().optional().describe("Thread ID to reply to"),
     inReplyTo: z.string().optional().describe("Message ID being replied to"),
-    attachments: z.array(z.string()).optional().describe("List of file paths to attach to the email"),
+    attachments: z.array(z.string()).optional().describe("List of file paths to attach; files must be inside the gmail-mcp files directory (~/Downloads/gmail-mcp)"),
 });
 
 const ReadEmailSchema = z.object({
@@ -314,7 +312,7 @@ const DownloadAttachmentSchema = z.object({
     messageId: z.string().describe("ID of the email message containing the attachment"),
     attachmentId: z.string().describe("ID of the attachment to download"),
     filename: z.string().optional().describe("Filename to save the attachment as (if not provided, uses original filename)"),
-    savePath: z.string().optional().describe("Directory path to save the attachment (defaults to current directory)"),
+    savePath: z.string().optional().describe("Directory to save the attachment in; must be inside the gmail-mcp files directory (defaults to it)"),
 });
 
 
@@ -1127,7 +1125,7 @@ async function main() {
                         const buffer = Buffer.from(data, 'base64url');
 
                         // Determine save path and filename
-                        const savePath = validatedArgs.savePath || process.cwd();
+                        const savePath = resolveInsideFilesDir(validatedArgs.savePath || FILES_DIR, 'directory');
                         let filename = validatedArgs.filename;
                         
                         if (!filename) {
@@ -1155,14 +1153,12 @@ async function main() {
                             filename = findAttachment(messageResponse.data.payload) || `attachment-${validatedArgs.attachmentId}`;
                         }
 
-                        // Ensure save directory exists
-                        if (!fs.existsSync(savePath)) {
-                            fs.mkdirSync(savePath, { recursive: true });
-                        }
+                        // The name comes from the sender (or the model); strip any path parts.
+                        filename = sanitizeAttachmentFilename(filename, `attachment-${validatedArgs.attachmentId.slice(0, 16)}`);
 
-                        // Write file
+                        // 'wx' never overwrites an existing file and never follows a planted symlink
                         const fullPath = path.join(savePath, filename);
-                        fs.writeFileSync(fullPath, buffer);
+                        fs.writeFileSync(fullPath, buffer, { flag: 'wx' });
 
                         return {
                             content: [

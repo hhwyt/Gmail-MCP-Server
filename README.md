@@ -1,5 +1,13 @@
 # Gmail AutoAuth MCP Server
 
+> **This fork (hhwyt) fixes three security issues in upstream 1.1.11 (upstream is archived).** All tools are unchanged.
+>
+> 1. **Attachment downloads cannot escape their folder.** Sender-controlled file names are reduced to a bare name (`../../.zshrc` → `_zshrc`), `savePath` must be inside the files directory, and existing files are never overwritten.
+> 2. **Outgoing attachments are limited to one folder.** `send_email` / `draft_email` only attach files inside the files directory (symlinks resolved), so a prompt-injected request cannot mail out `~/.ssh/id_rsa`.
+> 3. **No plaintext secrets on disk.** OAuth client keys and tokens are stored in the macOS keychain (service `gmail-mcp`); `gcp-oauth.keys.json` is imported once and can then be deleted.
+>
+> Files directory: `~/Downloads/gmail-mcp` (override with `GMAIL_MCP_FILES_DIR`). Several mailboxes: run one instance per mailbox with `GMAIL_ACCOUNT=<name>`; each keeps its own keychain token. Authorize with `GMAIL_ACCOUNT=<name> node dist/index.js auth`. Tests: `npm run build && npm test`. macOS only.
+
 A Model Context Protocol (MCP) server for Gmail integration in Claude Desktop with auto authentication support. This server enables AI assistants to manage Gmail through natural language interactions.
 
 ![](https://badge.mcpx.dev?type=server 'MCP Server')

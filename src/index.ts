@@ -326,6 +326,13 @@ async function main() {
         process.exit(0);
     }
 
+    // Prints the mailbox the stored token belongs to, so a wrong-account login is caught
+    if (process.argv[2] === 'whoami') {
+        const profile = await google.gmail({ version: 'v1', auth: oauth2Client }).users.getProfile({ userId: 'me' });
+        console.log(profile.data.emailAddress);
+        process.exit(0);
+    }
+
     // Initialize Gmail API
     const gmail = google.gmail({ version: 'v1', auth: oauth2Client });
 
